@@ -1,41 +1,28 @@
 """
-prediction_dag.py — Airflow 3.x DAG for scheduled batch predictions.
+prediction_dag.py — Airflow 3.x batch prediction DAG.
 
 Schedule: every 2 minutes
-Pipeline:
-  1. find_good_files      — locate validated CSV files in /data/good/
-  2. run_predictions      — POST rows to the model service /predict endpoint
-  3. archive_predicted    — move processed good files to /data/predicted/
-
-If no new files are found, the DAG skips gracefully (AirflowSkipException).
+Tasks:
+  check_for_new_data  → lists CSV files in good_data not yet predicted
+                        raises AirflowSkipException if none → entire DAG run = skipped
+  make_predictions    → reads all new files, sends ONE batch API call
 """
-
 from __future__ import annotations
 
-import glob
 import os
-import shutil
 from datetime import datetime, timedelta
 
+import pandas as pd
 import requests
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowSkipException
 
-import pandas as pd
+API_URL = os.getenv("MODEL_SERVICE_URL", "http://api:8000")
+DATA_DIR = "/opt/airflow/data"
+GOOD_DATA_PATH = os.path.join(DATA_DIR, "good_data")
+TRACKER_FILE = os.path.join(DATA_DIR, ".last_predicted_files")
 
-# ── Constants ─────────────────────────────────────────────────────
-GOOD_DIR = os.getenv("GOOD_DATA_DIR", "/data/good")
-PREDICTED_DIR = os.getenv("PREDICTED_DATA_DIR", "/data/predicted")
-MODEL_SERVICE_URL = os.getenv("MODEL_SERVICE_URL", "http://model_service:8000")
-
-FEATURES = [
-    "order_dow",
-    "order_hour_of_day",
-    "days_since_prior_order",
-    "add_to_cart_order",
-    "department_id",
-    "aisle_id",
-]
+FEATURES = ["order_dow", "order_hour_of_day", "days_since_prior"]
 
 DEFAULT_ARGS = {
     "owner": "airflow",
@@ -44,10 +31,23 @@ DEFAULT_ARGS = {
 }
 
 
+def _load_already_predicted() -> set[str]:
+    if os.path.exists(TRACKER_FILE):
+        with open(TRACKER_FILE) as f:
+            return {line.strip() for line in f if line.strip()}
+    return set()
+
+
+def _mark_as_predicted(file_names: list[str]) -> None:
+    with open(TRACKER_FILE, "a") as f:
+        for name in file_names:
+            f.write(name + "\n")
+
+
 @dag(
-    dag_id="instacart_predictions",
+    dag_id="prediction_job_dag",
     description="Batch predictions on validated Instacart CSV chunks",
-    schedule="*/2 * * * *",  # every 2 minutes
+    schedule="*/2 * * * *",
     start_date=datetime(2024, 1, 1),
     catchup=False,
     default_args=DEFAULT_ARGS,
@@ -56,124 +56,83 @@ DEFAULT_ARGS = {
 def prediction_dag():
 
     @task
-    def find_good_files() -> list[str]:
-        """Return CSV paths from GOOD_DIR that have not yet been predicted."""
-        os.makedirs(GOOD_DIR, exist_ok=True)
-        os.makedirs(PREDICTED_DIR, exist_ok=True)
+    def check_for_new_data() -> list[str]:
+        """
+        Returns list of new file names in good_data.
+        Raises AirflowSkipException if there are none — this marks the
+        entire DAG run as skipped (not just this task).
+        """
+        os.makedirs(GOOD_DATA_PATH, exist_ok=True)
+        all_files = {f for f in os.listdir(GOOD_DATA_PATH) if f.endswith(".csv")}
+        already_predicted = _load_already_predicted()
+        new_files = sorted(all_files - already_predicted)
 
-        already_predicted = {
-            os.path.basename(p)
-            for p in glob.glob(os.path.join(PREDICTED_DIR, "*.csv"))
-        }
-        all_good = sorted(glob.glob(os.path.join(GOOD_DIR, "*.csv")))
-        new_files = [f for f in all_good if os.path.basename(f) not in already_predicted]
-
-        print(f"Found {len(new_files)} new good file(s) to predict.")
+        print(f"Good data files: {len(all_files)} total, {len(new_files)} new.")
 
         if not new_files:
-            raise AirflowSkipException("No new files to predict. Skipping DAG run.")
+            raise AirflowSkipException("No new data in good_data — DAG run skipped.")
 
         return new_files
 
     @task
-    def run_predictions(file_paths: list[str]) -> dict:
+    def make_predictions(new_files: list[str]) -> dict:
         """
-        For each good file, build the features payload and call POST /predict.
-        Returns summary stats pushed via XCom.
+        Reads all new CSV files, builds ONE batch payload, and calls /predict once.
         """
-        if not file_paths:
-            raise AirflowSkipException("Empty file list — nothing to predict.")
+        all_records = []
+        file_row_counts: dict[str, int] = {}
 
-        total_rows = 0
-        total_reordered = 0
-        failed_files = []
-
-        for path in file_paths:
-            fname = os.path.basename(path)
-            print(f"Predicting {fname} ...")
-
+        for file_name in new_files:
+            file_path = os.path.join(GOOD_DATA_PATH, file_name)
             try:
-                df = pd.read_csv(path)
+                df = pd.read_csv(file_path)
             except Exception as exc:
-                print(f"  Cannot read {fname}: {exc}")
-                failed_files.append(fname)
+                print(f"  Cannot read {file_name}: {exc} — skipping.")
                 continue
 
-            # Keep only known feature columns that are present
             available = [c for c in FEATURES if c in df.columns]
             if not available:
-                print(f"  No feature columns found in {fname}, skipping.")
-                failed_files.append(fname)
+                print(f"  No features found in {file_name} — skipping.")
                 continue
 
-            features_df = df[available].copy()
+            for _, row in df.iterrows():
+                user_id = int(row["user_id"]) if "user_id" in row else 0
+                record = {
+                    "user_id": user_id,
+                    "features": {
+                        "order_dow": int(row["order_dow"]),
+                        "order_hour_of_day": int(row["order_hour_of_day"]),
+                        "days_since_prior": float(row["days_since_prior"]),
+                    },
+                    "source": "scheduled",
+                }
+                all_records.append(record)
 
-            # Cast types to Python natives for JSON serialisation
-            records = []
-            for _, row in features_df.iterrows():
-                record = {}
-                for col in FEATURES:
-                    if col not in row:
-                        continue
-                    val = row[col]
-                    if col == "days_since_prior_order":
-                        record[col] = float(val)
-                    else:
-                        record[col] = int(val)
-                records.append(record)
+            file_row_counts[file_name] = len(df)
 
-            if not records:
-                continue
+        if not all_records:
+            print("No valid records to predict.")
+            return {"total": 0, "reordered": 0}
 
-            payload = {"features": records}
+        # Single API call for the entire batch
+        payload = {"predictions": all_records}
+        try:
+            resp = requests.post(f"{API_URL}/predict", json=payload, timeout=60)
+            resp.raise_for_status()
+            predictions = resp.json()["predictions"]
+            reordered_count = sum(1 for p in predictions if p["reordered"])
+            print(
+                f"Batch prediction complete: {len(predictions)} rows, "
+                f"{reordered_count} will reorder."
+            )
+            _mark_as_predicted(list(file_row_counts.keys()))
+            return {"total": len(predictions), "reordered": reordered_count}
+        except requests.exceptions.RequestException as exc:
+            raise RuntimeError(f"API call failed: {exc}") from exc
 
-            try:
-                resp = requests.post(
-                    f"{MODEL_SERVICE_URL}/predict?source=scheduled",
-                    json=payload,
-                    timeout=30,
-                )
-                resp.raise_for_status()
-                predictions = resp.json()["predictions"]
-                reordered_count = sum(1 for p in predictions if p["reordered"])
-
-                print(
-                    f"  {fname}: {len(predictions)} predictions, "
-                    f"{reordered_count} will reorder."
-                )
-                total_rows += len(predictions)
-                total_reordered += reordered_count
-
-            except requests.exceptions.RequestException as exc:
-                print(f"  API call failed for {fname}: {exc}")
-                failed_files.append(fname)
-
-        summary = {
-            "total_rows": total_rows,
-            "total_reordered": total_reordered,
-            "failed_files": failed_files,
-        }
-        print(f"\nBatch summary: {summary}")
-        return summary
-
-    @task
-    def archive_predicted(file_paths: list[str]) -> None:
-        """Move good files to the predicted/ directory after successful inference."""
-        if not file_paths:
-            return
-        os.makedirs(PREDICTED_DIR, exist_ok=True)
-        for path in file_paths:
-            dest = os.path.join(PREDICTED_DIR, os.path.basename(path))
-            shutil.move(path, dest)
-            print(f"Archived {os.path.basename(path)} → predicted/")
-
-    # ── DAG wiring ────────────────────────────────────────────────
-    files = find_good_files()
-    summary = run_predictions(files)
-    archive_predicted(files)
-
-    # Ensure archive runs after predictions are done
-    summary >> archive_predicted(files)
+    # ── DAG wiring ─────────────────────────────────────────────
+    new_files = check_for_new_data()
+    make_predictions(new_files)
 
 
 prediction_dag()

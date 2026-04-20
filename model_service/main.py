@@ -1,53 +1,44 @@
 import os
+import pickle
 from contextlib import asynccontextmanager
-from datetime import datetime, date
-from typing import Any, Optional
+from datetime import datetime
+from typing import Any, List, Optional
 
-import joblib
 import numpy as np
 import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from database import Base, engine, get_db
-from models import Prediction
+from database import PredictionRecord, get_db, init_db
 
 # ── Model state ──────────────────────────────────────────────────
-_model: Any = None
-_scaler: Any = None
-MODEL_VERSION = os.getenv("MODEL_VERSION", "1.0.0")
-MODELS_DIR = os.getenv("MODELS_DIR", "/app/models")
+_artifact: Any = None  # dict with keys: model, scaler, features, version
+MODEL_PATH = os.getenv("MODEL_PATH", "/code/model/saved_model/model.pkl")
 
-FEATURES = [
-    "order_dow", "order_hour_of_day", "days_since_prior_order",
-    "add_to_cart_order", "department_id", "aisle_id",
-]
+FEATURES = ["order_dow", "order_hour_of_day", "days_since_prior"]
 
 
-def _load_artifacts() -> None:
-    """Load model and scaler from disk into module-level state."""
-    global _model, _scaler
-    model_path = f"{MODELS_DIR}/model.joblib"
-    scaler_path = f"{MODELS_DIR}/scaler.joblib"
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model not found at {model_path}")
-    _model = joblib.load(model_path)
-    _scaler = joblib.load(scaler_path)
+def _load_model() -> None:
+    global _artifact
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(f"Model not found at {MODEL_PATH}")
+    with open(MODEL_PATH, "rb") as f:
+        _artifact = pickle.load(f)
+    print(f"Model loaded from {MODEL_PATH} (version={_artifact.get('version','?')})")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load model artifacts once at API startup."""
-    Base.metadata.create_all(bind=engine)
-    _load_artifacts()
+    _load_model()
+    init_db()
     yield
 
 
 app = FastAPI(
     title="Instacart Reorder Prediction API",
     version="1.0.0",
-    description="Predicts whether a product will be reordered.",
+    description="Predicts whether a user will reorder.",
     lifespan=lifespan,
 )
 
@@ -56,168 +47,126 @@ app = FastAPI(
 class OrderFeatures(BaseModel):
     order_dow: int = Field(..., ge=0, le=6, description="Day of week (0=Sunday)")
     order_hour_of_day: int = Field(..., ge=0, le=23, description="Hour of day")
-    days_since_prior_order: float = Field(..., ge=0, le=30, description="Days since last order")
-    add_to_cart_order: int = Field(..., ge=1, le=100, description="Position in cart")
-    department_id: int = Field(..., ge=1, le=21, description="Product department")
-    aisle_id: int = Field(..., ge=1, le=134, description="Product aisle")
+    days_since_prior: float = Field(..., ge=0, le=30, description="Days since last order")
 
     model_config = {"json_schema_extra": {"example": {
-        "order_dow": 2, "order_hour_of_day": 14,
-        "days_since_prior_order": 7.0, "add_to_cart_order": 3,
-        "department_id": 4, "aisle_id": 24,
+        "order_dow": 2, "order_hour_of_day": 14, "days_since_prior": 7.0,
     }}}
 
 
-class PredictRequest(BaseModel):
-    features: list[OrderFeatures] = Field(..., min_length=1)
+class SinglePredictionRequest(BaseModel):
+    user_id: int = Field(..., description="User ID")
+    features: OrderFeatures
+    source: str = Field("webapp", description="Source: webapp | scheduled")
 
 
-class SinglePrediction(BaseModel):
-    reordered: bool
-    probability: float
-    features: dict
+class BatchPredictionRequest(BaseModel):
+    predictions: List[SinglePredictionRequest] = Field(..., min_length=1)
 
 
-class PredictResponse(BaseModel):
-    predictions: list[SinglePrediction]
-    count: int
-    model_version: str
-
-
-class PastPrediction(BaseModel):
-    id: int
-    predicted_at: str
-    order_dow: int
-    order_hour_of_day: int
-    days_since_prior_order: float
-    add_to_cart_order: int
-    department_id: int
-    aisle_id: int
+class PredictionResponse(BaseModel):
+    user_id: int
     reordered: bool
     probability: float
     model_version: str
     source: str
+    created_at: Optional[datetime] = None
+
+
+class BatchPredictionResponse(BaseModel):
+    predictions: List[PredictionResponse]
+    count: int
+    model_version: str
+
+
+class PastPredictionSchema(BaseModel):
+    id: int
+    user_id: int
+    input_features: Any
+    prediction_result: int
+    probability: float
+    source: str
+    model_version: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
 
 
 # ── Helpers ──────────────────────────────────────────────────────
-def _to_df(features: list[OrderFeatures]) -> pd.DataFrame:
-    """Convert a list of OrderFeatures to a DataFrame."""
-    return pd.DataFrame([f.model_dump() for f in features])
-
-
-def _predict(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-    """Return (predictions, probabilities) for a feature DataFrame."""
-    X = _scaler.transform(df[FEATURES])
-    probs = _model.predict_proba(X)[:, 1]
-    preds = (probs >= 0.5).astype(int)
-    return preds, probs
-
-
-def _save_predictions(
-    db: Session,
-    df: pd.DataFrame,
-    preds: np.ndarray,
-    probs: np.ndarray,
-    source: str,
-) -> None:
-    """Persist all predictions to the database."""
-    for i, row in df.iterrows():
-        record = Prediction(
-            order_dow=int(row["order_dow"]),
-            order_hour_of_day=int(row["order_hour_of_day"]),
-            days_since_prior_order=float(row["days_since_prior_order"]),
-            add_to_cart_order=int(row["add_to_cart_order"]),
-            department_id=int(row["department_id"]),
-            aisle_id=int(row["aisle_id"]),
-            reordered=bool(preds[i]),
-            probability=round(float(probs[i]), 4),
-            model_version=MODEL_VERSION,
-            source=source,
-        )
-        db.add(record)
-    db.commit()
+def _predict_one(features: OrderFeatures) -> tuple[bool, float]:
+    if _artifact is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Model not loaded.")
+    model = _artifact["model"]
+    scaler = _artifact["scaler"]
+    X = pd.DataFrame([[features.order_dow, features.order_hour_of_day, features.days_since_prior]],
+                     columns=FEATURES)
+    X_scaled = scaler.transform(X)
+    prob = float(model.predict_proba(X_scaled)[0, 1])
+    return prob >= 0.5, round(prob, 4)
 
 
 # ── Endpoints ────────────────────────────────────────────────────
 @app.get("/health", status_code=status.HTTP_200_OK)
-def health_check():
-    """Liveness probe for Docker health check."""
+def health():
     return {"status": "healthy"}
 
 
-@app.post(
-    "/predict",
-    response_model=PredictResponse,
-    status_code=status.HTTP_200_OK,
-)
+@app.post("/predict", response_model=BatchPredictionResponse, status_code=status.HTTP_200_OK)
 def predict(
-    body: PredictRequest,
-    source: str = Query("webapp", description="Source: webapp | scheduled"),
+    body: BatchPredictionRequest,
     db: Session = Depends(get_db),
 ):
-    """Predict reorder probability for one or more orders."""
-    if _model is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Model not loaded.",
+    """Batch prediction endpoint — accepts 1 or more requests."""
+    version = _artifact["version"] if _artifact else "v1.0"
+    results = []
+
+    for req in body.predictions:
+        reordered, prob = _predict_one(req.features)
+        record = PredictionRecord(
+            user_id=req.user_id,
+            input_features=req.features.model_dump(),
+            prediction_result=int(reordered),
+            probability=prob,
+            source=req.source,
+            model_version=version,
         )
-    df = _to_df(body.features)
-    preds, probs = _predict(df)
-    _save_predictions(db, df, preds, probs, source)
+        db.add(record)
+        db.flush()
+        results.append(PredictionResponse(
+            user_id=req.user_id,
+            reordered=reordered,
+            probability=prob,
+            model_version=version,
+            source=req.source,
+            created_at=record.created_at,
+        ))
 
-    results = [
-        SinglePrediction(
-            reordered=bool(preds[i]),
-            probability=round(float(probs[i]), 4),
-            features=body.features[i].model_dump(),
-        )
-        for i in range(len(preds))
-    ]
-    return PredictResponse(
-        predictions=results, count=len(results), model_version=MODEL_VERSION
-    )
+    db.commit()
+    return BatchPredictionResponse(predictions=results, count=len(results), model_version=version)
 
 
-@app.get(
-    "/past-predictions",
-    response_model=list[PastPrediction],
-    status_code=status.HTTP_200_OK,
-)
+@app.get("/past-predictions", response_model=List[PastPredictionSchema], status_code=status.HTTP_200_OK)
 def past_predictions(
-    start_date: Optional[date] = Query(None, description="Filter from date (YYYY-MM-DD)"),
-    end_date: Optional[date] = Query(None, description="Filter to date (YYYY-MM-DD)"),
-    source: Optional[str] = Query(
-        "all", description="Source filter: webapp | scheduled | all"
-    ),
+    user_id: Optional[int] = Query(None),
+    start_date: Optional[datetime] = Query(None),
+    end_date: Optional[datetime] = Query(None),
+    source: Optional[str] = Query("all"),
     limit: int = Query(500, ge=1, le=5000),
     db: Session = Depends(get_db),
 ):
-    """Return past predictions with optional date and source filtering."""
-    query = db.query(Prediction)
-
+    query = db.query(PredictionRecord)
+    if user_id is not None:
+        query = query.filter(PredictionRecord.user_id == user_id)
     if start_date:
-        query = query.filter(Prediction.predicted_at >= datetime.combine(start_date, datetime.min.time()))
+        query = query.filter(PredictionRecord.created_at >= start_date)
     if end_date:
-        query = query.filter(Prediction.predicted_at <= datetime.combine(end_date, datetime.max.time()))
+        query = query.filter(PredictionRecord.created_at <= end_date)
     if source and source != "all":
-        query = query.filter(Prediction.source == source)
+        query = query.filter(PredictionRecord.source == source)
+    return query.order_by(PredictionRecord.created_at.desc()).limit(limit).all()
 
-    rows = query.order_by(Prediction.predicted_at.desc()).limit(limit).all()
 
-    return [
-        PastPrediction(
-            id=r.id,
-            predicted_at=r.predicted_at.isoformat(),
-            order_dow=r.order_dow,
-            order_hour_of_day=r.order_hour_of_day,
-            days_since_prior_order=r.days_since_prior_order,
-            add_to_cart_order=r.add_to_cart_order,
-            department_id=r.department_id,
-            aisle_id=r.aisle_id,
-            reordered=r.reordered,
-            probability=r.probability,
-            model_version=r.model_version,
-            source=r.source,
-        )
-        for r in rows
-    ]
+@app.get("/")
+def root():
+    return {"message": "Instacart Reorder Prediction API", "status": "ready"}

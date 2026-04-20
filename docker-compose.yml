@@ -2,123 +2,126 @@ x-airflow-common: &airflow-common
   image: apache/airflow:3.0.0
   environment: &airflow-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-    AIRFLOW__CORE__FERNET_KEY: "46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho="
-    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://admin:secure_password123@db:5432/airflow_db
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
-    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "30"
-    AIRFLOW_CONN_POSTGRES_DSP: "postgresql://dsp:dsp@postgres:5432/dsp"
-    MODEL_SERVICE_URL: "http://model_service:8000"
-    RAW_DATA_DIR: "/data/raw"
-    GOOD_DATA_DIR: "/data/good"
-    BAD_DATA_DIR: "/data/bad"
-    PROCESSED_DATA_DIR: "/data/processed"
-    PREDICTED_DATA_DIR: "/data/predicted"
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "15"
+    AIRFLOW_CONN_POSTGRES_DEFAULT: "postgresql://admin:secure_password123@db:5432/prediction_db"
+    MODEL_SERVICE_URL: "http://api:8000"
+    _PIP_ADDITIONAL_REQUIREMENTS: >-
+      great-expectations
+      psycopg2-binary
+      pandas>=2.2
+      numpy
+      requests
+      scikit-learn
   volumes:
     - ./dags:/opt/airflow/dags
-    - ./data:/data
+    - ./data:/opt/airflow/data
     - airflow_logs:/opt/airflow/logs
   depends_on:
-    postgres:
+    db:
       condition: service_healthy
   restart: unless-stopped
 
 services:
-  # ── PostgreSQL (single instance, two databases) ──────────────────
-  postgres:
+  # ── PostgreSQL (single instance, two databases) ───────────────
+  db:
     image: postgres:16-alpine
+    container_name: postgres_db
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      # The entrypoint script creates additional DBs listed here
-      POSTGRES_MULTIPLE_DATABASES: "dsp:dsp:dsp,airflow:airflow:airflow"
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: secure_password123
+      POSTGRES_DB: prediction_db
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./docker/pg-init-scripts:/docker-entrypoint-initdb.d
-      - ./init.sql:/docker-entrypoint-initdb.d/02_app_schema.sql
+      - ./db_init/init.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U admin -d prediction_db"]
       interval: 5s
-      timeout: 5s
+      timeout: 3s
       retries: 10
-    restart: unless-stopped
 
-  # ── Model Service (FastAPI) ──────────────────────────────────────
-  model_service:
+  # ── FastAPI Model Service ─────────────────────────────────────
+  api:
     build:
-      context: ./model_service
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: model_service/Dockerfile
+    container_name: fastapi_api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
     environment:
-      DATABASE_URL: "postgresql://dsp:dsp@postgres:5432/dsp"
-      MODEL_VERSION: "1.0.0"
-      MODELS_DIR: "/app/models"
-    volumes:
-      - ./models:/app/models:ro
+      DATABASE_URL: "postgresql+psycopg://admin:secure_password123@db:5432/prediction_db"
+      MODEL_PATH: "/code/model/saved_model/model.pkl"
     ports:
       - "8000:8000"
-    depends_on:
-      postgres:
-        condition: service_healthy
+    volumes:
+      - ./model_service:/code
+      - ./model:/code/model
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 10s
       timeout: 5s
       retries: 5
-    restart: unless-stopped
 
-  # ── Streamlit Web App ────────────────────────────────────────────
+  # ── Streamlit Web App ─────────────────────────────────────────
   webapp:
     build:
-      context: ./webapp
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: webapp/Dockerfile
+    container_name: streamlit_app
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
     environment:
-      API_URL: "http://model_service:8000"
+      API_URL: "http://api:8000"
     ports:
       - "8501:8501"
-    depends_on:
-      model_service:
-        condition: service_healthy
-    restart: unless-stopped
 
-  # ── Airflow Init (one-shot) ──────────────────────────────────────
+  # ── Airflow Init (runs once) ──────────────────────────────────
   airflow-init:
     <<: *airflow-common
+    container_name: airflow_init
+    restart: "no"
     entrypoint: /bin/bash
     command:
       - -c
       - |
         airflow db migrate
-        airflow connections add 'postgres_dsp' \
+        airflow connections add 'postgres_default' \
           --conn-type postgres \
-          --conn-host postgres \
-          --conn-schema dsp \
-          --conn-login dsp \
-          --conn-password dsp \
+          --conn-host db \
+          --conn-schema prediction_db \
+          --conn-login admin \
+          --conn-password secure_password123 \
           --conn-port 5432 || true
         airflow users create \
           --username admin \
-          --firstname Admin \
-          --lastname User \
+          --password admin \
+          --firstname Admin --lastname Admin \
           --role Admin \
-          --email admin@example.com \
-          --password admin || true
-    restart: "no"
+          --email admin@example.com || true
 
-  # ── Airflow Scheduler ────────────────────────────────────────────
+  # ── Airflow Scheduler ─────────────────────────────────────────
   airflow-scheduler:
     <<: *airflow-common
+    container_name: airflow_scheduler
     command: scheduler
     depends_on:
       airflow-init:
         condition: service_completed_successfully
-    restart: unless-stopped
 
-  # ── Airflow Webserver ────────────────────────────────────────────
+  # ── Airflow Webserver ─────────────────────────────────────────
   airflow-webserver:
     <<: *airflow-common
+    container_name: airflow_webserver
     command: webserver
     ports:
       - "8080:8080"
@@ -130,7 +133,6 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-    restart: unless-stopped
 
 volumes:
   postgres_data:

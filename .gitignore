@@ -1,57 +1,23 @@
-# Python
 __pycache__/
 *.py[cod]
 *.pyo
-*.pyd
-*.so
-*.egg
-*.egg-info/
-dist/
-build/
-.eggs/
-.tox/
 .venv/
 venv/
 env/
-
-# Pytest / Coverage
 .pytest_cache/
 .coverage
 htmlcov/
-
-# Environment
 .env
 *.env.local
-
-# Jupyter
-.ipynb_checkpoints/
-*.ipynb
-
-# OS
 .DS_Store
 Thumbs.db
-
-# IDE
 .vscode/
 .idea/
-
-# Docker volumes / logs
 logs/
 postgres_data/
-
-# Data files (keep .gitkeep placeholders, not actual data)
-data/**/*.csv
-data/**/*.parquet
-data/**/*.json
+data/raw_data/*.csv
+data/good_data/*.csv
+data/bad_data/*.csv
 !data/.gitkeep
-
-# Models (large binary artifacts)
-models/*.joblib
-models/*.pkl
-models/*.h5
-!models/.gitkeep
-
-# Airflow
-airflow.cfg
-airflow.db
-webserver_config.py
+model/saved_model/*.pkl
+!model/.gitkeep

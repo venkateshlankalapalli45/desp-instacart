@@ -1,41 +1,37 @@
 """
-ingestion_dag.py — Airflow 3.x DAG for Instacart data ingestion & validation.
+ingestion_dag.py — Airflow 3.x ingestion + GX Core v1 validation DAG.
 
 Schedule: every 1 minute
-Pipeline:
-  1. scan_new_files     — find unprocessed CSV chunks in /data/raw/
-  2. validate_files     — run Great Expectations (GX Core v1) checks on each file
-  3. store_stats        — persist ingestion statistics to the database
-  4. route_files        — copy valid rows → /data/good/, invalid rows → /data/bad/
+Tasks:
+  read_data        → picks one random CSV from raw_data, pushes path via XCom
+  validate_data    → runs GX Core v1 Checkpoint, computes criticality
+  save_statistics  → stores stats to PostgreSQL via PostgresHook
+  send_alerts      → logs Teams-style alert for Medium/High criticality
+  split_and_save   → routes rows to good_data / bad_data
+Tasks save_statistics, send_alerts, split_and_save run in parallel after validate_data.
 """
-
 from __future__ import annotations
 
-import glob
+import json
 import os
+import random
 import shutil
 from datetime import datetime, timedelta
 
 import great_expectations as gx
 import pandas as pd
 from airflow.decorators import dag, task
+from airflow.exceptions import AirflowSkipException
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
-# ── Constants ─────────────────────────────────────────────────────
-RAW_DIR = os.getenv("RAW_DATA_DIR", "/data/raw")
-GOOD_DIR = os.getenv("GOOD_DATA_DIR", "/data/good")
-BAD_DIR = os.getenv("BAD_DATA_DIR", "/data/bad")
-PROCESSED_DIR = os.getenv("PROCESSED_DATA_DIR", "/data/processed")
-POSTGRES_CONN_ID = "postgres_dsp"
+DATA_DIR = "/opt/airflow/data"
+RAW_DATA_PATH = os.path.join(DATA_DIR, "raw_data")
+GOOD_DATA_PATH = os.path.join(DATA_DIR, "good_data")
+BAD_DATA_PATH = os.path.join(DATA_DIR, "bad_data")
+GX_ROOT = os.path.join(DATA_DIR, "gx")
 
-FEATURES = [
-    "order_dow",
-    "order_hour_of_day",
-    "days_since_prior_order",
-    "add_to_cart_order",
-    "department_id",
-    "aisle_id",
-]
+REQUIRED_COLS = ["user_id", "order_dow", "order_hour_of_day", "days_since_prior"]
+POSTGRES_CONN_ID = "postgres_default"
 
 DEFAULT_ARGS = {
     "owner": "airflow",
@@ -44,243 +40,244 @@ DEFAULT_ARGS = {
 }
 
 
-def _build_gx_suite(context: gx.DataContext) -> str:
-    """Create (or retrieve) the expectation suite for Instacart data."""
-    suite_name = "instacart_suite"
-    try:
-        suite = context.suites.get(suite_name)
-    except Exception:
-        suite = context.suites.add(
-            gx.ExpectationSuite(name=suite_name)
-        )
-
-    # Clear existing expectations and rebuild to ensure idempotency
-    suite.expectations = []
-
-    from great_expectations.expectations import (
-        ExpectColumnToExist,
-        ExpectColumnValuesToBeBetween,
-        ExpectColumnValuesToBeOfType,
-        ExpectColumnValuesToNotBeNull,
-    )
-
-    for col in FEATURES:
-        suite.add_expectation(ExpectColumnToExist(column=col))
-        suite.add_expectation(ExpectColumnValuesToNotBeNull(column=col))
-
-    suite.add_expectation(
-        ExpectColumnValuesToBeBetween(column="order_dow", min_value=0, max_value=6)
-    )
-    suite.add_expectation(
-        ExpectColumnValuesToBeBetween(column="order_hour_of_day", min_value=0, max_value=23)
-    )
-    suite.add_expectation(
-        ExpectColumnValuesToBeBetween(
-            column="days_since_prior_order", min_value=0.0, max_value=30.0
-        )
-    )
-    suite.add_expectation(
-        ExpectColumnValuesToBeBetween(column="add_to_cart_order", min_value=1, max_value=100)
-    )
-    suite.add_expectation(
-        ExpectColumnValuesToBeBetween(column="department_id", min_value=1, max_value=21)
-    )
-    suite.add_expectation(
-        ExpectColumnValuesToBeBetween(column="aisle_id", min_value=1, max_value=134)
-    )
-
-    context.suites.update(suite)
-    return suite_name
-
-
 @dag(
-    dag_id="instacart_ingestion",
-    description="Scan, validate, and route new Instacart CSV chunks",
-    schedule="* * * * *",  # every 1 minute
+    dag_id="data_ingestion_dag",
+    description="Ingest, validate, and route Instacart CSV chunks",
+    schedule="* * * * *",
     start_date=datetime(2024, 1, 1),
     catchup=False,
     default_args=DEFAULT_ARGS,
-    tags=["instacart", "ingestion", "great-expectations"],
+    tags=["instacart", "ingestion"],
 )
 def ingestion_dag():
 
     @task
-    def scan_new_files() -> list[str]:
-        """Return paths of CSV files in RAW_DIR not yet moved to processed/."""
-        os.makedirs(RAW_DIR, exist_ok=True)
-        os.makedirs(PROCESSED_DIR, exist_ok=True)
+    def read_data() -> dict:
+        for p in [RAW_DATA_PATH, GOOD_DATA_PATH, BAD_DATA_PATH]:
+            os.makedirs(p, exist_ok=True)
 
-        processed = {
-            os.path.basename(p)
-            for p in glob.glob(os.path.join(PROCESSED_DIR, "**/*.csv"), recursive=True)
-        }
-        all_files = sorted(glob.glob(os.path.join(RAW_DIR, "*.csv")))
-        new_files = [f for f in all_files if os.path.basename(f) not in processed]
+        files = [f for f in os.listdir(RAW_DATA_PATH) if f.endswith(".csv")]
+        if not files:
+            raise AirflowSkipException("No files in raw_data — skipping DAG run.")
 
-        print(f"Found {len(new_files)} new file(s) to process.")
-        return new_files
+        chosen = random.choice(files)
+        file_path = os.path.join(RAW_DATA_PATH, chosen)
+        print(f"Selected file: {chosen}")
+        return {"file_name": chosen, "file_path": file_path}
 
     @task
-    def validate_files(file_paths: list[str]) -> list[dict]:
-        """
-        Run Great Expectations validation on each file.
-        Returns a list of result dicts with keys:
-          path, valid_rows, invalid_rows, total_rows, passed, failed_expectations
-        """
-        if not file_paths:
-            return []
+    def validate_data(file_info: dict) -> dict:
+        file_path = file_info["file_path"]
+        file_name = file_info["file_name"]
 
-        os.makedirs(GOOD_DIR, exist_ok=True)
-        os.makedirs(BAD_DIR, exist_ok=True)
+        # ── Read CSV ───────────────────────────────────────────
+        try:
+            df = pd.read_csv(file_path)
+        except Exception as exc:
+            return {
+                "criticality": "High",
+                "bad_indices": [],
+                "total_records": 0,
+                "bad_count": 0,
+                "missing_column": True,
+                "error": str(exc),
+            }
 
-        # Build in-memory GX context (no local filesystem store needed)
+        total_records = len(df)
+
+        # ── GX Core v1 setup (ephemeral context) ──────────────
         context = gx.get_context(mode="ephemeral")
-        suite_name = _build_gx_suite(context)
 
-        results = []
-
-        for path in file_paths:
-            fname = os.path.basename(path)
-            print(f"Validating {fname} ...")
-
-            try:
-                df = pd.read_csv(path)
-            except Exception as exc:
-                print(f"  Cannot read {fname}: {exc}")
-                shutil.copy(path, os.path.join(BAD_DIR, fname))
-                results.append({
-                    "path": path,
-                    "valid_rows": 0,
-                    "invalid_rows": 0,
-                    "total_rows": 0,
-                    "passed": False,
-                    "failed_expectations": [f"unreadable: {exc}"],
-                })
-                continue
-
-            # Validate row by row using pandas datasource
-            data_source = context.data_sources.add_pandas("pd_source")
-            data_asset = data_source.add_dataframe_asset(name=fname)
-            batch_def = data_asset.add_batch_definition_whole_dataframe(name="batch")
-            batch = batch_def.get_batch(batch_parameters={"dataframe": df})
-
-            validation_def = context.validation_definitions.add(
-                gx.ValidationDefinition(
-                    name=f"val_{fname}",
-                    data=batch_def,
-                    suite=context.suites.get(suite_name),
-                )
+        suite = context.suites.add(gx.ExpectationSuite(name="instacart_suite"))
+        suite.add_expectation(gx.expectations.ExpectColumnToExist(column="user_id"))
+        suite.add_expectation(gx.expectations.ExpectColumnToExist(column="order_dow"))
+        suite.add_expectation(gx.expectations.ExpectColumnToExist(column="order_hour_of_day"))
+        suite.add_expectation(gx.expectations.ExpectColumnToExist(column="days_since_prior"))
+        suite.add_expectation(gx.expectations.ExpectColumnValuesToNotBeNull(column="order_dow"))
+        suite.add_expectation(gx.expectations.ExpectColumnValuesToNotBeNull(column="order_hour_of_day"))
+        suite.add_expectation(gx.expectations.ExpectColumnValuesToNotBeNull(column="days_since_prior"))
+        suite.add_expectation(
+            gx.expectations.ExpectColumnValuesToBeBetween(column="order_dow", min_value=0, max_value=6)
+        )
+        suite.add_expectation(
+            gx.expectations.ExpectColumnValuesToBeBetween(
+                column="order_hour_of_day", min_value=0, max_value=23
             )
-            result = context.run_validation_definition(validation=validation_def)
+        )
+        suite.add_expectation(
+            gx.expectations.ExpectColumnValuesToBeBetween(
+                column="days_since_prior", min_value=0, max_value=30
+            )
+        )
 
-            # ── Identify bad rows (column-level check) ────────────
-            bad_mask = pd.Series([False] * len(df), index=df.index)
+        # ── Batch definition ────────────────────────────────
+        ds = context.data_sources.add_pandas("pd_source")
+        asset = ds.add_dataframe_asset(name=file_name)
+        batch_def = asset.add_batch_definition_whole_dataframe("batch")
 
-            for col in FEATURES:
-                if col not in df.columns:
-                    bad_mask[:] = True
-                    continue
-                # Null check
+        val_def = context.validation_definitions.add(
+            gx.ValidationDefinition(
+                name=f"val_{file_name.replace('.', '_')}",
+                data=batch_def,
+                suite=suite,
+            )
+        )
+
+        checkpoint = context.checkpoints.add(
+            gx.Checkpoint(
+                name=f"cp_{file_name.replace('.', '_')}",
+                validation_definitions=[val_def],
+                result_format="COMPLETE",
+            )
+        )
+
+        result = checkpoint.run(batch_parameters={"dataframe": df})
+
+        # ── Build Data Docs ────────────────────────────────
+        try:
+            context.build_data_docs()
+        except Exception as exc:
+            print(f"Data Docs build warning: {exc}")
+
+        # ── Extract bad indices ────────────────────────────
+        missing_col = False
+        bad_indices: set[int] = set()
+
+        run_results = result.run_results
+        for run_key in run_results:
+            vr = run_results[run_key]
+            for res in vr.results:
+                if not res.success:
+                    etype = res.expectation_config.type
+                    if "column_to_exist" in etype:
+                        missing_col = True
+                    ul = getattr(res.result, "unexpected_index_list", None)
+                    if ul:
+                        bad_indices.update(ul)
+
+        # Row-level safety net
+        bad_mask = pd.Series([False] * total_records, index=df.index)
+        for col in REQUIRED_COLS:
+            if col not in df.columns:
+                bad_mask[:] = True
+                missing_col = True
+            else:
                 bad_mask |= df[col].isna()
 
-            # Range checks
-            range_checks = {
-                "order_dow": (0, 6),
-                "order_hour_of_day": (0, 23),
-                "days_since_prior_order": (0.0, 30.0),
-                "add_to_cart_order": (1, 100),
-                "department_id": (1, 21),
-                "aisle_id": (1, 134),
-            }
-            for col, (lo, hi) in range_checks.items():
-                if col in df.columns:
-                    numeric = pd.to_numeric(df[col], errors="coerce")
-                    bad_mask |= numeric.isna() | (numeric < lo) | (numeric > hi)
+        range_checks = {
+            "order_dow": (0, 6),
+            "order_hour_of_day": (0, 23),
+            "days_since_prior": (0.0, 30.0),
+        }
+        for col, (lo, hi) in range_checks.items():
+            if col in df.columns:
+                numeric = pd.to_numeric(df[col], errors="coerce")
+                bad_mask |= numeric.isna() | (numeric < lo) | (numeric > hi)
 
-            # Duplicate check (mark all but first occurrence)
-            bad_mask |= df.duplicated(keep="first")
+        bad_mask |= df.duplicated(keep="first")
+        bad_indices.update(df[bad_mask].index.tolist())
 
-            good_df = df[~bad_mask].copy()
-            bad_df = df[bad_mask].copy()
+        bad_count = len(bad_indices)
+        invalid_pct = (bad_count / total_records * 100) if total_records > 0 else 0
 
-            # Write split files
-            good_path = os.path.join(GOOD_DIR, fname)
-            bad_path = os.path.join(BAD_DIR, fname)
-            good_df.to_csv(good_path, index=False)
-            if not bad_df.empty:
-                bad_df.to_csv(bad_path, index=False)
+        if missing_col or invalid_pct > 50:
+            criticality = "High"
+        elif invalid_pct >= 10:
+            criticality = "Medium"
+        elif invalid_pct > 0:
+            criticality = "Low"
+        else:
+            criticality = "None"
 
-            passed = result.success
-            failed = [
-                str(r["expectation_config"]["type"])
-                for r in result.results
-                if not r["success"]
-            ]
+        print(
+            f"Validation complete: {total_records} rows, {bad_count} invalid "
+            f"({invalid_pct:.1f}%) — criticality={criticality}"
+        )
 
-            print(
-                f"  {fname}: {len(good_df)} valid / {len(bad_df)} invalid rows"
-                f" | suite passed={passed}"
-            )
-
-            results.append({
-                "path": path,
-                "valid_rows": int(len(good_df)),
-                "invalid_rows": int(len(bad_df)),
-                "total_rows": int(len(df)),
-                "passed": bool(passed),
-                "failed_expectations": failed,
-            })
-
-        return results
+        return {
+            "criticality": criticality,
+            "bad_indices": list(bad_indices),
+            "total_records": total_records,
+            "bad_count": bad_count,
+            "missing_column": missing_col,
+        }
 
     @task
-    def store_stats(validation_results: list[dict]) -> None:
-        """Persist ingestion statistics to the ingestion_stats table."""
-        if not validation_results:
-            print("No results to store.")
-            return
-
+    def save_statistics(file_info: dict, validation: dict) -> None:
         hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
-        conn = hook.get_conn()
-        cursor = conn.cursor()
-
-        insert_sql = """
+        hook.run(
+            """
             INSERT INTO ingestion_stats
-                (file_name, total_rows, valid_rows, invalid_rows, passed, failed_expectations)
+                (run_id, file_name, rows_total, rows_valid, rows_invalid, error_summary)
             VALUES (%s, %s, %s, %s, %s, %s)
-        """
-
-        for r in validation_results:
-            cursor.execute(insert_sql, (
-                os.path.basename(r["path"]),
-                r["total_rows"],
-                r["valid_rows"],
-                r["invalid_rows"],
-                r["passed"],
-                ", ".join(r["failed_expectations"]) if r["failed_expectations"] else "",
-            ))
-
-        conn.commit()
-        cursor.close()
-        conn.close()
-        print(f"Stored stats for {len(validation_results)} file(s).")
+            """,
+            parameters=(
+                str(datetime.utcnow().timestamp()),
+                file_info["file_name"],
+                validation["total_records"],
+                validation["total_records"] - validation["bad_count"],
+                validation["bad_count"],
+                json.dumps({
+                    "criticality": validation["criticality"],
+                    "missing_column": validation["missing_column"],
+                }),
+            ),
+        )
+        print(f"Stats saved for {file_info['file_name']}")
 
     @task
-    def archive_files(file_paths: list[str]) -> None:
-        """Move processed raw files to the processed/ directory."""
-        if not file_paths:
+    def send_alerts(file_info: dict, validation: dict) -> None:
+        criticality = validation["criticality"]
+        if criticality not in ("Medium", "High"):
+            print("No alert needed (criticality=None or Low).")
             return
-        os.makedirs(PROCESSED_DIR, exist_ok=True)
-        for path in file_paths:
-            dest = os.path.join(PROCESSED_DIR, os.path.basename(path))
-            shutil.move(path, dest)
-            print(f"Archived {os.path.basename(path)} → processed/")
 
-    # ── DAG wiring ────────────────────────────────────────────────
-    files = scan_new_files()
-    results = validate_files(files)
-    store_stats(results)
-    archive_files(files)
+        bad = validation["bad_count"]
+        total = validation["total_records"]
+        pct = (bad / total * 100) if total else 0
+        print("─" * 60)
+        print("  TEAMS ALERT — Data Quality Alerts channel")
+        print(f"  Criticality : {criticality}")
+        print(f"  File        : {file_info['file_name']}")
+        print(f"  Issues      : {bad}/{total} rows ({pct:.1f}%) failed validation")
+        print(f"  Missing col : {validation['missing_column']}")
+        print("─" * 60)
+
+    @task
+    def split_and_save_data(file_info: dict, validation: dict) -> None:
+        file_path = file_info["file_path"]
+        file_name = file_info["file_name"]
+        bad_indices = set(validation["bad_indices"])
+        total = validation["total_records"]
+
+        if total == 0:
+            shutil.move(file_path, os.path.join(BAD_DATA_PATH, file_name))
+            return
+
+        df = pd.read_csv(file_path)
+
+        if not bad_indices:
+            shutil.move(file_path, os.path.join(GOOD_DATA_PATH, file_name))
+            print(f"All rows valid → moved to good_data/{file_name}")
+        elif len(bad_indices) >= total:
+            shutil.move(file_path, os.path.join(BAD_DATA_PATH, file_name))
+            print(f"All rows invalid → moved to bad_data/{file_name}")
+        else:
+            good_df = df.drop(index=list(bad_indices))
+            bad_df = df.iloc[list(bad_indices)]
+            good_df.to_csv(os.path.join(GOOD_DATA_PATH, f"good_{file_name}"), index=False)
+            bad_df.to_csv(os.path.join(BAD_DATA_PATH, f"bad_{file_name}"), index=False)
+            os.remove(file_path)
+            print(f"Split: {len(good_df)} good, {len(bad_df)} bad rows")
+
+    # ── DAG wiring ─────────────────────────────────────────────
+    file_info = read_data()
+    validation = validate_data(file_info)
+
+    # save_statistics, send_alerts, split_and_save run in parallel
+    save_statistics(file_info, validation)
+    send_alerts(file_info, validation)
+    split_and_save_data(file_info, validation)
 
 
 ingestion_dag()

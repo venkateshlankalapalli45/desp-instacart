@@ -1,47 +1,27 @@
 # Instacart Reorder Prediction — DSP Defense 1
 
-End-to-end MLOps project: a production-grade prediction service for the Instacart reorder dataset, built with FastAPI, Streamlit, Apache Airflow 3, PostgreSQL, and Docker.
+Production MLOps pipeline: FastAPI + Streamlit + Airflow 3.x + PostgreSQL + Docker.
 
 ---
 
-## Architecture
-
-```
-┌─────────────┐    ┌───────────────┐    ┌──────────────────┐
-│  Streamlit  │───▶│  FastAPI API  │───▶│   PostgreSQL     │
-│  Webapp     │    │  (port 8000)  │    │  (dsp + airflow) │
-│  (port 8501)│    └───────────────┘    └──────────────────┘
-└─────────────┘            ▲                      ▲
-                           │                      │
-                   ┌───────────────┐    ┌──────────────────┐
-                   │  Airflow      │    │  /data/          │
-                   │  DAGs         │────│  raw/ good/ bad/ │
-                   │  (port 8080)  │    └──────────────────┘
-                   └───────────────┘
-```
-
 ## Services
 
-| Service           | URL                    | Credentials     |
-|-------------------|------------------------|-----------------|
-| Streamlit webapp  | http://localhost:8501  | —               |
-| FastAPI docs      | http://localhost:8000/docs | —           |
-| Airflow webserver | http://localhost:8080  | admin / admin   |
-| PostgreSQL        | localhost:5432         | postgres / postgres |
+| Service           | URL                    | Credentials         |
+|-------------------|------------------------|---------------------|
+| Streamlit webapp  | http://localhost:8501  | —                   |
+| FastAPI docs      | http://localhost:8000/docs | —               |
+| Airflow webserver | http://localhost:8080  | admin / admin       |
+| PostgreSQL        | localhost:5432         | admin / secure_password123 |
 
 ---
 
 ## Quick Start
 
-### Prerequisites
-- Docker & Docker Compose installed
-- At least 4 GB of free RAM
-
 ### 1 — Clone and configure
 
 ```bash
-git clone https://github.com/<your-org>/dsp-instacart.git
-cd dsp-instacart
+git clone https://github.com/venkateshlankalapalli45/desp-instacart.git
+cd desp-instacart
 cp .env.example .env
 ```
 
@@ -51,42 +31,35 @@ cp .env.example .env
 docker compose up --build -d
 ```
 
-Wait ~60 seconds for all services to initialize, then verify:
+Wait ~2 minutes for Airflow to initialise. Verify:
 
 ```bash
-docker compose ps          # all services should be "healthy" or "running"
-curl http://localhost:8000/health   # → {"status": "healthy"}
+curl http://localhost:8000/health   # → {"status":"healthy"}
 ```
 
-### 3 — Generate sample data for the DAGs
+### 3 — Generate data files for Airflow ingestion
 
 ```bash
-# Split the training set into 10-row chunks for the ingestion DAG
-python scripts/split_dataset.py --input data/train.csv --output data/raw/
+# Generate 30 chunk files (10 rows each) → data/raw_data/
+python scripts/split_data.py data/instacart_sample.csv data/raw_data 30
 
-# (Optional) inject some errors to see GE validation in action
-python scripts/generate_errors.py --input data/raw/ --output data/raw/ --fraction 0.3
+# (Optional) inject errors into some files for demo
+python scripts/data_error_injection.py data/instacart_sample.csv data/raw_data/error_file.csv 0.4
 ```
 
-### 4 — Open the UI
+### 4 — Open the apps
 
-- **Streamlit** → http://localhost:8501 — make single or batch predictions
-- **Airflow** → http://localhost:8080 — monitor the ingestion and prediction DAGs
-- **FastAPI docs** → http://localhost:8000/docs — explore the REST API
+- **Streamlit** → http://localhost:8501
+- **Airflow**   → http://localhost:8080 (login: admin / admin)
+- **API docs**  → http://localhost:8000/docs
 
 ---
 
 ## Training the Model
 
 ```bash
-python ml/train.py --data data/train.csv --output models/
-```
-
-This writes `models/model.joblib` and `models/scaler.joblib`.  
-Restart `model_service` after retraining:
-
-```bash
-docker compose restart model_service
+python scripts/train.py --data data/instacart_sample.csv --output model/saved_model/
+docker compose restart api
 ```
 
 ---
@@ -102,72 +75,35 @@ pytest tests/ -v --tb=short
 
 ## Airflow DAGs
 
-| DAG                     | Schedule   | Description                                      |
-|-------------------------|------------|--------------------------------------------------|
-| `instacart_ingestion`   | every 1 min | Scans `/data/raw/`, validates with GX, routes rows to `good/` or `bad/`, saves stats |
-| `instacart_predictions` | every 2 min | Reads `/data/good/`, calls `/predict`, archives files |
-
----
-
-## API Endpoints
-
-| Method | Path               | Description                          |
-|--------|--------------------|--------------------------------------|
-| GET    | `/health`          | Liveness probe                       |
-| POST   | `/predict`         | Single or batch reorder prediction   |
-| GET    | `/past-predictions`| Historical predictions with filters  |
-
-### Example prediction request
-
-```bash
-curl -X POST http://localhost:8000/predict \
-  -H "Content-Type: application/json" \
-  -d '{"features": [{"order_dow": 2, "order_hour_of_day": 14, "days_since_prior_order": 7.0, "add_to_cart_order": 3, "department_id": 4, "aisle_id": 24}]}'
-```
+| DAG                   | Schedule   | Description                                                        |
+|-----------------------|------------|--------------------------------------------------------------------|
+| `data_ingestion_dag`  | every 1 min | Picks random CSV from `raw_data`, validates with GX Core, saves stats, routes good/bad rows |
+| `prediction_job_dag`  | every 2 min | Reads new files from `good_data`, calls `/predict` in one batch call. Skips if no new data |
 
 ---
 
 ## Project Structure
 
 ```
-dsp-instacart/
-├── data/               # Raw, good, bad, processed, predicted CSV chunks
-├── dags/
-│   ├── ingestion_dag.py
-│   └── prediction_dag.py
-├── docker/
-│   └── pg-init-scripts/   # Multi-database PostgreSQL init
-├── ml/
-│   └── train.py           # Model training script
-├── model_service/         # FastAPI prediction service
-│   ├── main.py
-│   ├── models.py
-│   ├── database.py
-│   ├── Dockerfile
-│   └── requirements.txt
-├── models/                # Trained model artifacts
-├── scripts/
-│   ├── generate_errors.py
-│   └── split_dataset.py
-├── tests/                 # pytest test suite
-├── webapp/                # Streamlit multipage app
-│   ├── Home.py
-│   ├── pages/
-│   │   ├── 1_Predict.py
-│   │   └── 2_Past_Predictions.py
-│   ├── Dockerfile
-│   └── requirements.txt
+desp-instacart/
+├── dags/               # Airflow 3.x DAGs
+├── data/               # raw_data/, good_data/, bad_data/, gx/
+├── db_init/            # PostgreSQL init SQL
+├── model/              # Trained model artifact (model.pkl)
+├── model_service/      # FastAPI prediction service
+├── scripts/            # train.py, split_data.py, data_error_injection.py
+├── tests/              # pytest test suite
+├── webapp/             # Streamlit multipage app
 ├── docker-compose.yml
-├── init.sql
 ├── .env.example
-└── .gitignore
+└── README.md
 ```
 
 ---
 
-## Stopping the Stack
+## Stop
 
 ```bash
-docker compose down          # stop containers (data persists)
-docker compose down -v       # stop and delete all volumes (full reset)
+docker compose down          # keep volumes
+docker compose down -v       # full reset
 ```
