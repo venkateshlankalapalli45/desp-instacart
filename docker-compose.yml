@@ -5,7 +5,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://admin:secure_password123@db:5432/airflow_db
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
-    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    AIRFLOW__API__EXPOSE_CONFIG: "true"
     AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "15"
     AIRFLOW_CONN_POSTGRES_DEFAULT: "postgresql://admin:secure_password123@db:5432/prediction_db"
     MODEL_SERVICE_URL: "http://api:8000"
@@ -118,11 +118,20 @@ services:
       airflow-init:
         condition: service_completed_successfully
 
-  # ── Airflow Webserver ─────────────────────────────────────────
+  # ── Airflow DAG Processor (required in Airflow 3.x) ──────────
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow_dag_processor
+    command: dag-processor
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ── Airflow API Server (replaces webserver in Airflow 3.x) ───
   airflow-webserver:
     <<: *airflow-common
     container_name: airflow_webserver
-    command: webserver
+    command: api-server
     ports:
       - "8080:8080"
     depends_on:
